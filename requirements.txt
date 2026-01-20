@@ -1,4 +1,5 @@
 --extra-index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://flashinfer.ai/whl/cu130
 -c constraints.txt
 accelerate>=1.7.0
 build
@@ -54,6 +55,8 @@ peft
 patchelf
 einops
 flashinfer-python~=0.6.0
+flashinfer-cubin==0.6.1
+flashinfer-jit-cache==0.6.1
 opencv-python-headless
 xgrammar==0.1.25
 llguidance==0.7.29
