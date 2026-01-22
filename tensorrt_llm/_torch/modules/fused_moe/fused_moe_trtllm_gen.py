@@ -496,6 +496,7 @@ class TRTLLMGenFusedMoE(MoE):
                 x_sf.shape
             ) == 2, f"x_sf should be 2D tensor, got shape {x_sf.shape}"
             x_sf = x_sf.flatten()
+        # import remote_pdb; remote_pdb.RemotePdb('127.0.0.1', 4444+self.tp_rank).set_trace()
 
         if self.has_deepseek_fp8_block_scales:
             assert do_finalize, "fp8_block_scale_moe_runner does not support do_finalize=False"
@@ -553,6 +554,33 @@ class TRTLLMGenFusedMoE(MoE):
             # print(f"PID: {os.getpid()}, waiting for gdb to attach...")
             if self.use_flashinfer:
                 if router_logits is not None:
+                    # w3_w1_weight = self.w3_w1_weight[:, :self.intermediate_size*2, :].contiguous()
+                    # w3_w1_weight_scale = self.w3_w1_weight_scale[:, :self.intermediate_size*2, :].contiguous()
+                    # w3_w1_bias = self.w3_w1_bias[:, :self.intermediate_size*2].contiguous()
+                    # w2_weight = self.w2_weight[:, :, :self.intermediate_size//2].contiguous()
+                    # w2_weight_scale = self.w2_weight_scale[:, :, :self.intermediate_size//16].contiguous()
+                    # w2_bias = self.w2_bias[:, :].contiguous()
+                    # tmp_x = x[:, :].contiguous()
+                    # tmp_x_sf = x_sf.reshape(x.shape[0], -1)[:, :].reshape(-1).contiguous()
+
+                    # 深拷贝输入参数，用于第二个函数调用
+                    router_logits_copy = router_logits.clone() if router_logits is not None else None
+                    routing_bias_copy = routing_bias.clone() if routing_bias is not None else None
+                    x_copy = x.clone()
+                    x_sf_copy = x_sf.clone()
+                    w3_w1_weight_copy = self.w3_w1_weight.clone()
+                    w3_w1_weight_scale_copy = self.w3_w1_weight_scale.clone()
+                    w3_w1_bias_copy = self.w3_w1_bias.clone() if self.bias else None
+                    w2_weight_copy = self.w2_weight.clone()
+                    w2_weight_scale_copy = self.w2_weight_scale.clone()
+                    w2_bias_copy = self.w2_bias.clone() if self.bias else None
+                    fc31_scale_c_copy = self.fc31_scale_c.data.clone()
+                    fc31_alpha_copy = self.fc31_alpha.data.clone()
+                    fc2_alpha_copy = self.fc2_alpha.data.clone()
+
+                    original_w3_w1_bias = self.w3_w1_bias * self.fc31_alpha.data.view(-1, 1)  # 还原
+                    original_w2_bias = self.w2_bias * self.fc2_alpha.data.view(-1, 1)
+                    new_output = x.new_empty([x.shape[0], self.hidden_size], dtype=torch.bfloat16)
                     outputs = flashinfer_fused_moe.trtllm_fp4_block_scale_moe(
                         router_logits,
                         routing_bias,
@@ -560,14 +588,14 @@ class TRTLLMGenFusedMoE(MoE):
                         x_sf.view(torch.float8_e4m3fn),
                         self.w3_w1_weight,
                         self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
-                        gemm1_bias=None,
-                        gemm1_alpha=None,
-                        gemm1_beta=None,
-                        gemm1_clamp_limit=None,
+                        original_w3_w1_bias if self.bias else None,
+                        gemm1_alpha=self.swiglu_alpha,
+                        gemm1_beta=self.swiglu_beta,
+                        gemm1_clamp_limit=self.swiglu_limit,
                         gemm2_weights=self.w2_weight,
                         gemm2_weights_scale=self.w2_weight_scale.view(
                             torch.float8_e4m3fn),
-                        gemm2_bias=None,
+                        gemm2_bias=original_w2_bias if self.bias else None,
                         output1_scale_scalar=self.fc31_scale_c.data,
                         output1_scale_gate_scalar=self.fc31_alpha.data,
                         output2_scale_scalar=self.fc2_alpha.data,
@@ -575,7 +603,7 @@ class TRTLLMGenFusedMoE(MoE):
                         top_k=top_k,
                         n_group=n_group,
                         topk_group=topk_group,
-                        intermediate_size=self.intermediate_size_per_partition,
+                        intermediate_size=intermediate_size_per_partition_padded,
                         local_expert_offset=self.slot_start,
                         local_num_experts=self.expert_size_per_partition,
                         routed_scaling_factor=routed_scaling_factor,
@@ -583,25 +611,82 @@ class TRTLLMGenFusedMoE(MoE):
                         routing_method_type,
                         do_finalize=do_finalize,
                         gated_act_type=0,  # SwiGlu
+                        output=new_output
                     )
+
+
+                    # # gemm1_bias * gemm1_scales_global * hidden_states_scale_global
+                    # w3_w1_bias_copy.div_((fc31_alpha_copy).view(-1, 1))
+
+
+                    # w2_bias_copy.div_((fc2_alpha_copy).view(-1, 1))
+
+                    # # swiglu_beta_copy.div_((fc31_alpha_copy))
+
+                    # self.swiglu_limit.div_((fc31_alpha_copy))
+
+                    # from tensorrt_llm._torch.modules.fused_moe.quantization import trtllmgen_maybe_get_cached_w3_w1_permute_indices, trtllmgen_maybe_get_cached_w2_permute_indices
+                    # epilogue_tile_m = 128
+                    # permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+                    #     w3_w1_bias_copy[0], self.quant_method._cache_permute_indices, epilogue_tile_m).to(w3_w1_bias_copy[0].device)
+                    # for i in range(len(w3_w1_bias_copy)):
+                    #     w3_w1_bias_copy[i] = torch.ops.trtllm.shuffle_matrix(
+                    #         w3_w1_bias_copy[i],
+                    #         permute_indices)
+
+                    # permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
+                    #     w2_bias_copy[0], self.quant_method._cache_permute_indices, epilogue_tile_m).to(w2_bias_copy[0].device)
+                    # for i in range(len(w2_bias_copy)):
+                    #     w2_bias_copy[i] = torch.ops.trtllm.shuffle_matrix(
+                    #         w2_bias_copy[i],
+                    #         permute_indices)
+                    tmps = torch.ops.trtllm.fp4_block_scale_moe_runner(
+                        router_logits_copy,
+                        routing_bias_copy,
+                        x_copy,
+                        x_sf_copy.view(torch.float8_e4m3fn),
+                        w3_w1_weight_copy,
+                        w3_w1_weight_scale_copy.view(torch.float8_e4m3fn),
+                        w3_w1_bias_copy,
+                        self.swiglu_alpha,
+                        self.swiglu_beta,
+                        self.swiglu_limit,
+                        w2_weight_copy,
+                        w2_weight_scale_copy.view(torch.float8_e4m3fn),
+                        w2_bias_copy,
+                        fc31_scale_c_copy,
+                        fc31_alpha_copy,
+                        fc2_alpha_copy,
+                        self.num_slots,
+                        top_k,
+                        n_group,
+                        topk_group,
+                        intermediate_size_per_partition_padded,
+                        self.slot_start,
+                        self.expert_size_per_partition,
+                        routed_scaling_factor,
+                        self.routing_method.routing_method_type,
+                        do_finalize=do_finalize,
+                        topk_weights=token_final_scales,
+                        topk_ids=token_selected_experts,
+                    )
+                    # import remote_pdb; remote_pdb.RemotePdb('127.0.0.1', 4444).set_trace()
                 else:
-                    packed_tensor = (token_selected_experts.to(torch.int32) <<
-                                     16) | token_final_scales.to(
-                                         torch.bfloat16).view(torch.int16)
-                    outputs = flashinfer_fused_moe.trtllm_fp4_block_scale_routed_moe(
-                        packed_tensor,
+                    # import remote_pdb; remote_pdb.RemotePdb('127.0.0.1', 4444+self.tp_rank).set_trace()
+                    tmps = torch.ops.trtllm.fp4_block_scale_moe_runner(
+                        router_logits,
                         routing_bias,
                         x,
                         x_sf.view(torch.float8_e4m3fn),
                         self.w3_w1_weight,
                         self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
-                        None,
-                        None,
-                        None,
-                        None,
+                        self.w3_w1_bias if self.bias else None,
+                        self.swiglu_alpha,
+                        self.swiglu_beta,
+                        self.swiglu_limit,
                         self.w2_weight,
                         self.w2_weight_scale.view(torch.float8_e4m3fn),
-                        None,
+                        self.w2_bias if self.bias else None,
                         self.fc31_scale_c.data,
                         self.fc31_alpha.data,
                         self.fc2_alpha.data,
@@ -609,7 +694,43 @@ class TRTLLMGenFusedMoE(MoE):
                         top_k,
                         n_group,
                         topk_group,
-                        self.intermediate_size_per_partition,
+                        intermediate_size_per_partition_padded,
+                        self.slot_start,
+                        self.expert_size_per_partition,
+                        routed_scaling_factor,
+                        self.routing_method.routing_method_type,
+                        do_finalize=do_finalize,
+                        topk_weights=token_final_scales,
+                        topk_ids=token_selected_experts,
+                    )
+                    packed_tensor = (token_selected_experts.to(torch.int32) <<
+                                     16) | token_final_scales.to(
+                                         torch.bfloat16).view(torch.int16)
+                    # import remote_pdb; remote_pdb.RemotePdb('127.0.0.1', 4444+self.tp_rank).set_trace()
+                    if isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
+                        routing_bias = self.routing_method.e_score_correction_bias
+                    outputs = flashinfer_fused_moe.trtllm_fp4_block_scale_routed_moe(
+                        packed_tensor,
+                        routing_bias,
+                        x,
+                        x_sf.view(torch.float8_e4m3fn),
+                        self.w3_w1_weight,
+                        self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                        self.w3_w1_bias if self.bias else None,
+                        self.swiglu_alpha,
+                        self.swiglu_beta,
+                        self.swiglu_limit,
+                        self.w2_weight,
+                        self.w2_weight_scale.view(torch.float8_e4m3fn),
+                        self.w2_bias if self.bias else None,
+                        self.fc31_scale_c.data,
+                        self.fc31_alpha.data,
+                        self.fc2_alpha.data,
+                        self.num_slots,
+                        top_k,
+                        n_group,
+                        topk_group,
+                        intermediate_size_per_partition_padded,
                         self.slot_start,
                         self.expert_size_per_partition,
                         routed_scaling_factor,
@@ -618,6 +739,7 @@ class TRTLLMGenFusedMoE(MoE):
                         None,
                         0,  # act_type
                     )
+                    # import remote_pdb; remote_pdb.RemotePdb('127.0.0.1', 4444+self.tp_rank).set_trace()
             else:
                 outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                     router_logits,
@@ -665,7 +787,7 @@ class TRTLLMGenFusedMoE(MoE):
 
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // 2
-            if self.use_flashinfer:
+            if self.use_flashinfer and intermediate_size_per_partition_padded == self.intermediate_size_per_partition:
                 if router_logits is not None:
                     outputs = flashinfer_fused_moe.trtllm_fp4_block_scale_moe(
                         router_logits,
@@ -850,9 +972,39 @@ class TRTLLMGenFusedMoE(MoE):
 
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // 2
-
+            
             if self.use_flashinfer:
                 if router_logits is not None:
+                    final_hidden_states = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+                        router_logits,
+                        routing_bias,
+                        x,
+                        x_sf,
+                        self.w3_w1_weight,
+                        self.w3_w1_weight_scale,
+                        self.w3_w1_bias,
+                        self.swiglu_alpha,
+                        self.swiglu_beta,
+                        self.swiglu_limit,
+                        self.w2_weight,
+                        self.w2_weight_scale,
+                        self.w2_bias,
+                        self.num_slots,
+                        top_k,
+                        n_group,
+                        topk_group,
+                        intermediate_size_per_partition_padded,
+                        self.hidden_size,
+                        self.quant_method.intermediate_size_per_partition_lean,
+                        self.slot_start,
+                        self.expert_size_per_partition,
+                        routed_scaling_factor,
+                        self.routing_method.routing_method_type,
+                        0,  # act_type
+                        token_final_scales,
+                        token_selected_experts,
+                        output=moe_output,
+                    )
                     outputs = flashinfer_fused_moe.trtllm_fp4_block_scale_moe(
                         router_logits,
                         routing_bias,
@@ -883,6 +1035,8 @@ class TRTLLMGenFusedMoE(MoE):
                         do_finalize=do_finalize,
                         gated_act_type=0,  # SwiGlu
                         output=moe_output)
+                    # import remote_pdb; remote_pdb.RemotePdb('127.0.0.1', 4444).set_trace()
+                    import pdb;pdb.set_trace()
                 else:
                     packed_tensor = (token_selected_experts.to(torch.int32) <<
                                      16) | token_final_scales.to(
