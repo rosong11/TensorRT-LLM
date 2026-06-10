@@ -701,28 +701,13 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
-        fi_hidden_size = hidden_states.shape[1]
-        if hidden_states.dtype == torch.uint8:
-            fi_hidden_size *= 2
-
-        if gemm2_weights.shape[1] != fi_hidden_size:
-            raise ValueError(
-                "FlashInfer FP4 MoE GEMM2 expects gemm2_weights dim 1 "
-                f"to match hidden_states hidden size {fi_hidden_size}, "
-                f"got {gemm2_weights.shape[1]}."
-            )
-        if gemm2_weights_scale.shape[1] != fi_hidden_size:
-            raise ValueError(
-                "FlashInfer FP4 MoE GEMM2 expects gemm2_weights_scale dim 1 "
-                f"to match hidden_states hidden size {fi_hidden_size}, "
-                f"got {gemm2_weights_scale.shape[1]}."
-            )
-        if gemm2_bias is not None and gemm2_bias.shape[1] != fi_hidden_size:
-            raise ValueError(
-                "FlashInfer FP4 MoE GEMM2 expects gemm2_bias dim 1 "
-                f"to match hidden_states hidden size {fi_hidden_size}, "
-                f"got {gemm2_bias.shape[1]}."
-            )
+        if valid_hidden_size is not None:
+            # Current FlashInfer cubins build TMA descriptors from valid dims.
+            # Keep those dims aligned with the padded TRT-LLM weight layout; the
+            # caller slices the final output back to the model hidden size.
+            valid_hidden_size = ((valid_hidden_size + 127) // 128) * 128
+        if valid_intermediate_size is not None:
+            valid_intermediate_size = intermediate_size
 
         if router_logits is not None:
             outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
@@ -758,6 +743,8 @@ class FlashinferOpBackend(MoEOpBackend):
                 activation_type=self.cvt_activation_type(gated_act_type),
                 output=output,
                 tune_max_num_tokens=tune_max_num_tokens,
+                valid_hidden_size=valid_hidden_size,
+                valid_intermediate_size=valid_intermediate_size,
             )
         else:
             routing_input = (
@@ -797,6 +784,8 @@ class FlashinferOpBackend(MoEOpBackend):
                 activation_type=self.cvt_activation_type(gated_act_type),
                 output=output,
                 tune_max_num_tokens=tune_max_num_tokens,
+                valid_hidden_size=valid_hidden_size,
+                valid_intermediate_size=valid_intermediate_size,
             )
         if not do_finalize:
             if outputs[2].dim() != 2:

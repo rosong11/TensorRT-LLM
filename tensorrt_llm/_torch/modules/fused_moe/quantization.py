@@ -4872,13 +4872,7 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
 
 
 class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
-
-    def _get_w2_hidden_alignment(self, module: torch.nn.Module) -> int:
-        if getattr(module, "use_flashinfer", False):
-            # FlashInfer's FP4 MoE path currently uses the padded input hidden
-            # size for GEMM2 as well. Match that layout for W4A16 MXFP4.
-            return self.input_hidden_alignment
-        return super()._get_w2_hidden_alignment(module)
+    pass
 
 
 class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
@@ -4951,13 +4945,6 @@ class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 
 
 class W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
-
-    def _get_w2_hidden_alignment(self, module: torch.nn.Module) -> int:
-        if getattr(module, "use_flashinfer", False):
-            # FlashInfer's FP4 MoE path currently uses the padded input hidden
-            # size for GEMM2 as well. Match that layout for W4A8 MXFP4/MXFP8.
-            return self.input_hidden_alignment
-        return super()._get_w2_hidden_alignment(module)
 
     def create_weights(self, module: torch.nn.Module):
         super().create_weights(module)
